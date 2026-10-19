@@ -1,0 +1,8 @@
+[package]
+name = "future-slot"
+version = "0.1.0"
+edition = "2024"
+authors = ["Aspen Pratt <fuzzyzilla01@gmail.com>"]
+description = "A no-std no-alloc `Box<dyn Future>` analogue"
+keywords = ["no-std", "no-alloc", "future", "async"]
+categories = ["embedded", "asynchronous", "no-std", "no-std::no-alloc"]
