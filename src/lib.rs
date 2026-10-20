@@ -399,8 +399,13 @@ impl<'a, Output> Future for AtomicOwnedFuture<'a, Output> {
 /// RAM, which is re-used only by the same callsite. It is possible to share RAM
 /// between several callsites with direct use of the slot APIs.
 ///
-/// The argument of the macro is the function call who's result should be
-/// pinned.
+/// The argument of the macro is the *function call* who's result should be
+/// pinned, not just the result of the call, as the full name of the function is
+/// used to inform the size and align of the slot.
+///
+/// Note that outer generics cannot be present in this function, so
+/// `MyStruct::foo` will work, but `T::foo` will not - this is a purposeful
+/// limitation built into the compiler.
 ///
 /// Usage:
 /// ```rust
@@ -430,18 +435,24 @@ impl<'a, Output> Future for AtomicOwnedFuture<'a, Output> {
 /// }
 /// ```
 ///
-/// Expands to a value of type `Option<AtomicOwnedFuture<implicit output type>>`
+/// Expands to the return value of a call to
+/// [`AtomicFutureSlot::try_write_with`], which may be [`None`] if the last
+/// call's future still exists.
 #[macro_export]
 macro_rules! pin_to_static {
     (
-        // Limitation: no leading :: Function path (there's no built in type for
-        // this?!)
+        // FIXME: no leading ::
+
+        // Function path (there's no built in type for this?!)
         $first:ident
         $(
             ::$path:ident
         )*
         // Generic args, which cannot be implicit.
         $(
+            // FIXME: no lifetimes.
+
+            // FIXME: no const generics.
             ::<
             $(
                 $generic:ty
@@ -458,14 +469,14 @@ macro_rules! pin_to_static {
         )
     ) => {
         {
-            const SIZE: usize = $crate::size_of_output(&$first$(::$path)*$(::<$($generic),*>)?);
-            const ALIGN: usize = $crate::align_of_output(&$first$(::$path)*$(::<$($generic),*>)?);
-            const BOX: ::core::pin::Pin<&'static $crate::AtomicFutureSlot<SIZE, ALIGN>> = {
-                static BOX: $crate::AtomicFutureSlot<SIZE, ALIGN> = $crate::AtomicFutureSlot::new();
-                ::core::pin::Pin::static_ref(&BOX)
+            const SIZE: usize = $crate::size_of_output($first$(::$path)*$(::<$($generic),*>)?);
+            const ALIGN: usize = $crate::align_of_output($first$(::$path)*$(::<$($generic),*>)?);
+            const SLOT: ::core::pin::Pin<&'static $crate::AtomicFutureSlot<SIZE, ALIGN>> = {
+                static SLOT: $crate::AtomicFutureSlot<SIZE, ALIGN> = $crate::AtomicFutureSlot::new();
+                ::core::pin::Pin::static_ref(&SLOT)
             };
 
-            BOX.try_write_with(
+            SLOT.try_write_with(
                 move || {
                     ($first$(::$path)*$(::<$($generic),*>)?)
                     (
