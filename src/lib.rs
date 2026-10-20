@@ -21,19 +21,16 @@ use core::{
     task::{Context, Poll},
 };
 
-/// Contains implementation details needed by [`pin_to_static`]. Do not refer to
-/// them directly.
-#[doc(hidden)]
-pub mod _export {
-    /// Trait smuggling the output type out of a function, where the type may be
-    /// anonymous.
-    ///
-    /// Copy bound asserts no dtor, which allows it to be used as the argument to a
-    /// const function.
-    trait HasOutput<Args>: Copy {
-        type Output;
-    }
-    macro_rules! fns {
+/// Trait smuggling the output type out of a function, where the type may be
+/// anonymous.
+///
+/// Copy bound asserts no dtor, which allows it to be used as the argument to a
+/// const function.
+#[diagnostic::on_unimplemented(message = "implemented on functions with arity up to 12")]
+trait HasOutput<Args>: Copy {
+    type Output;
+}
+macro_rules! fns {
         {
             $(
             (
@@ -56,32 +53,40 @@ pub mod _export {
             )*
         };
     }
-    fns! {
-        (A),
-        (A,B),
-        (A,B,C),
-        (A,B,C,D),
-        (A,B,C,D,E),
-        (A,B,C,D,E,F),
-        (A,B,C,D,E,F,G),
-        (A,B,C,D,E,F,G,H),
-        (A,B,C,D,E,F,G,H,I),
-        (A,B,C,D,E,F,G,H,I,J),
-        (A,B,C,D,E,F,G,H,I,J,K),
-        (A,B,C,D,E,F,G,H,I,J,K,L),
-        // I got bored at an arbitrary depth
-    }
-    /// Returns the size of the return type of the function `F`, even if the
-    /// type is anonymous.
-    #[expect(private_bounds)]
-    pub const fn size_of_output<Args, F: HasOutput<Args>>(_: F) -> usize {
-        size_of::<F::Output>()
-    }
-    /// Returns the align of the return type of the function `F`, even if the type is anonymous.
-    #[expect(private_bounds)]
-    pub const fn align_of_output<Args, F: HasOutput<Args>>(_: F) -> usize {
-        align_of::<F::Output>()
-    }
+// Special-case zero arg version.
+impl<Func, Output> HasOutput<()> for Func
+where
+    Func: Copy + FnOnce() -> Output,
+{
+    type Output = Output;
+}
+fns! {
+    (A),
+    (A,B),
+    (A,B,C),
+    (A,B,C,D),
+    (A,B,C,D,E),
+    (A,B,C,D,E,F),
+    (A,B,C,D,E,F,G),
+    (A,B,C,D,E,F,G,H),
+    (A,B,C,D,E,F,G,H,I),
+    (A,B,C,D,E,F,G,H,I,J),
+    (A,B,C,D,E,F,G,H,I,J,K),
+    (A,B,C,D,E,F,G,H,I,J,K,L),
+    // I got bored at an arbitrary depth
+}
+
+/// Returns the size of the return type of the function `F`, even if the type is
+/// anonymous.
+#[expect(private_bounds)]
+pub const fn size_of_output<Args, F: HasOutput<Args>>(_: F) -> usize {
+    size_of::<F::Output>()
+}
+/// Returns the align of the return type of the function `F`, even if the type
+/// is anonymous.
+#[expect(private_bounds)]
+pub const fn align_of_output<Args, F: HasOutput<Args>>(_: F) -> usize {
+    align_of::<F::Output>()
 }
 
 /// Struct which is aligned to the amount given by it's generic parameter.
@@ -400,6 +405,7 @@ impl<'a, Output> Future for AtomicOwnedFuture<'a, Output> {
 ///
 /// Usage:
 /// ```rust
+/// use future_slot::pin_to_static;
 /// fn something_generic<T>(t: T) -> impl Future<Output = T> {
 ///     async move { t }
 /// }
@@ -408,18 +414,19 @@ impl<'a, Output> Future for AtomicOwnedFuture<'a, Output> {
 /// }
 ///
 ///
-/// fn something_concrete(t: usize) {
+/// fn something_concrete(t: i32) {
 ///     // Demonstrates mapping impl Future to a concrete type. Despite the two
-///     // branches returning different opaque types, they are both "boxed".
+///     // branches returning different opaque types, they are both "boxed"
+///     // into a `AtomicOwnedFuture<'static, i32>`
 ///     let _future = if false {
-///         // The generic parameter `usize` must be specified explicity.
-///         pin_to_static!(something_generic::<usize>(t))?;
+///         // The generic parameter must be specified explicity.
+///         pin_to_static!(something_generic::<i32>(t)).unwrap();
 ///     } else {
 ///         // ...but it doesn't have to be generic.
 ///
 ///         // Note that this does not share memory with the above even though
 ///         // it could! Use the API directly to achieve that effect.
-///         pin_to_static!(something_else())?;
+///         pin_to_static!(something_else()).unwrap();
 ///     };
 /// }
 /// ```
@@ -428,8 +435,8 @@ impl<'a, Output> Future for AtomicOwnedFuture<'a, Output> {
 #[macro_export]
 macro_rules! pin_to_static {
     (
-        // Limitation: no leading ::
-        // Function path (there's no built in type for this?!)
+        // Limitation: no leading :: Function path (there's no built in type for
+        // this?!)
         $first:ident
         $(
             ::$path:ident
@@ -452,9 +459,9 @@ macro_rules! pin_to_static {
         )
     ) => {
         {
-            const SIZE: usize = $crate::_export::size_of_output(&$first$(::$path)*$(::<$($generic),*>)?);
-            const ALIGN: usize = $crate::_export::align_of_output(&$first$(::$path)*$(::<$($generic),*>)?);
-            const BOX: Pin<&'static $crate::AtomicFutureSlot<SIZE, ALIGN>> = {
+            const SIZE: usize = $crate::size_of_output(&$first$(::$path)*$(::<$($generic),*>)?);
+            const ALIGN: usize = $crate::align_of_output(&$first$(::$path)*$(::<$($generic),*>)?);
+            const BOX: ::core::pin::Pin<&'static $crate::AtomicFutureSlot<SIZE, ALIGN>> = {
                 static BOX: $crate::AtomicFutureSlot<SIZE, ALIGN> = $crate::AtomicFutureSlot::new();
                 ::core::pin::Pin::static_ref(&BOX)
             };
@@ -469,4 +476,139 @@ macro_rules! pin_to_static {
             )
         }
     };
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    /// Naive polling executor.
+    fn poll_once<F: core::future::Future>(future: &mut F) -> Option<F::Output>
+    where
+        F: Unpin,
+    {
+        match Pin::new(future).poll(&mut core::task::Context::from_waker(
+            core::task::Waker::noop(),
+        )) {
+            Poll::Pending => None,
+            Poll::Ready(r) => Some(r),
+        }
+    }
+    /// Naive polling executor.
+    fn dumb_block_on<F: core::future::Future>(future: F) -> F::Output {
+        let mut future = core::pin::pin!(future);
+        loop {
+            if let core::task::Poll::Ready(r) = future.as_mut().poll(
+                &mut core::task::Context::from_waker(core::task::Waker::noop()),
+            ) {
+                return r;
+            }
+        }
+    }
+    fn yield_now() -> impl Future<Output = ()> {
+        let mut yielded = false;
+        core::future::poll_fn(move |cx| {
+            if yielded {
+                Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+    }
+
+    #[test]
+    fn output_size() {
+        use core::convert::identity;
+
+        assert_eq!(size_of_output(identity::<u128>), size_of::<u128>());
+        assert_eq!(size_of_output(identity::<u64>), size_of::<u64>());
+        assert_eq!(size_of_output(identity::<[u8; 25]>), 25);
+    }
+    #[test]
+    fn output_align() {
+        use core::convert::identity;
+
+        assert_eq!(align_of_output(identity::<(u8, u128)>), align_of::<u128>());
+        assert_eq!(align_of_output(identity::<u64>), align_of::<u64>());
+        assert_eq!(align_of_output(identity::<[u8; 13]>), 1);
+    }
+    #[test]
+    fn basic() {
+        fn hello() -> impl Future<Output = usize> {
+            async {
+                let mut test = 0;
+                for i in 0..10 {
+                    test += i;
+                    yield_now().await;
+                }
+                test
+            }
+        }
+        // Test to make sure our future works normally
+        assert_eq!(dumb_block_on(hello()), 45);
+
+        let box_hello = || pin_to_static!(hello()).unwrap();
+
+        // Box it once...
+        assert_eq!(dumb_block_on(box_hello()), 45);
+        // Re-use that box... Test this with miri to assure that no aliasing
+        // occurs!
+        assert_eq!(dumb_block_on(box_hello()), 45);
+    }
+    #[test]
+    fn drop_glue() {
+        /// Test drop glue, cancel safety, and preventing double-drops.
+        static DROP_COUNTER: core::sync::atomic::AtomicUsize =
+            core::sync::atomic::AtomicUsize::new(0);
+
+        #[derive(Clone)]
+        struct OnDrop;
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                DROP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        async fn hello(on_drop: OnDrop) {
+            yield_now().await;
+            drop(on_drop);
+            yield_now().await;
+        }
+
+        let box_hello = |on_drop| pin_to_static!(hello(on_drop)).unwrap();
+
+        // Normal operation;
+        {
+            let mut b = box_hello(OnDrop);
+
+            assert_eq!(poll_once(&mut b), None);
+            assert_eq!(DROP_COUNTER.load(Ordering::Relaxed), 0);
+            assert_eq!(poll_once(&mut b), None);
+            assert_eq!(DROP_COUNTER.load(Ordering::Relaxed), 1);
+            assert_eq!(poll_once(&mut b), Some(()));
+            drop(b);
+            // Ensure didn't double-drop
+            assert_eq!(DROP_COUNTER.load(Ordering::Relaxed), 1);
+        }
+
+        DROP_COUNTER.store(0, Ordering::Relaxed);
+
+        // Cancel early.
+        {
+            let mut b = box_hello(OnDrop);
+
+            assert_eq!(poll_once(&mut b), None);
+            assert_eq!(DROP_COUNTER.load(Ordering::Relaxed), 0);
+            drop(b);
+            assert_eq!(DROP_COUNTER.load(Ordering::Relaxed), 1);
+        }
+
+        DROP_COUNTER.store(0, Ordering::Relaxed);
+
+        // Cancel immediately..
+        {
+            let _ = box_hello(OnDrop);
+            assert_eq!(DROP_COUNTER.load(Ordering::Relaxed), 1);
+        }
+    }
 }
