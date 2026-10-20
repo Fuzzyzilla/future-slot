@@ -10,7 +10,7 @@
 //!
 //! You should see the size of the `.bss` segment change with the capacity of
 //! the slot.
-use future_slot::AtomicFutureSlot;
+use future_slot::atomic::AtomicFutureSlot;
 
 #[unsafe(no_mangle)]
 static _ATOMIC_FUTURE_SLOT: AtomicFutureSlot<65536, 1024> = AtomicFutureSlot::new();
