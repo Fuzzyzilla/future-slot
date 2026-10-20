@@ -321,6 +321,17 @@ where
             in_use: AtomicBool::new(false),
         }
     }
+    /// Try to get write access to the slot. Call [`AtomicSlotLock::write`] to
+    /// populate it. Returns None if there is still a outstanding
+    /// [`AtomicOwnedFuture`] residing in this slot.
+    pub fn try_lock(self: Pin<&'_ Self>) -> Option<AtomicSlotLock<'_, SIZE, ALIGN>> {
+        if self.in_use.swap(true, Ordering::Acquire) {
+            // Already in use.
+            None
+        } else {
+            Some(AtomicSlotLock(self))
+        }
+    }
     /// Try to insert a future into this slot, returning None if there is still
     /// a outstanding [`AtomicOwnedFuture`] residing in it.
     ///
@@ -329,22 +340,7 @@ where
         self: Pin<&'a Self>,
         f: impl FnOnce() -> F,
     ) -> Option<AtomicOwnedFuture<'a, F::Output>> {
-        if self.in_use.swap(true, Ordering::Acquire) {
-            // Already in use.
-            return None;
-        }
-        let this = self.get_ref();
-        // Setup freeing the slot first, so the slot is unreserved if `f`
-        // panics.
-        let release_on_drop = ReleaseOnDrop(&this.in_use);
-        let fut = f();
-
-        // We have acquired the lock and have exclusive access!
-        let slot = unsafe { &mut *this.slot.get() };
-        // Safety: Self is pinned so the fields of self are too!
-        let slot = unsafe { Pin::new_unchecked(slot) };
-        let owned = slot.write(fut);
-        Some(AtomicOwnedFuture(owned, release_on_drop))
+        self.try_lock().map(|slot| slot.write(f()))
     }
     /// Try to insert a future into this slot, returning None if there is still
     /// a outstanding [`AtomicOwnedFuture`] residing in it.
@@ -355,7 +351,7 @@ where
         self: Pin<&'a Self>,
         o: F,
     ) -> Option<AtomicOwnedFuture<'a, F::Output>> {
-        self.try_write_with(move || o)
+        self.try_lock().map(|slot| slot.write(o))
     }
 }
 // We use internal synchronization, it's fine to pass reference to this slot
@@ -363,6 +359,57 @@ where
 unsafe impl<const SIZE: usize, const ALIGN: usize> Sync for AtomicFutureSlot<SIZE, ALIGN> where
     Aligned<ALIGN>: AlignmentValid
 {
+}
+/// A lock representing an empty [`AtomicFutureSlot`] which can be infallibly
+/// [written to](Self::write).
+///
+/// This could be type-erased, but at the cost of compile-time size/align
+/// verification. I don't currently have a use for it to be type erased anyway.
+#[expect(private_bounds)]
+pub struct AtomicSlotLock<'a, const SIZE: usize, const ALIGN: usize>(
+    /// Invariant: We have exclusive access to this slot, and in_use is true.
+    Pin<&'a AtomicFutureSlot<SIZE, ALIGN>>,
+)
+where
+    Aligned<ALIGN>: AlignmentValid;
+impl<const SIZE: usize, const ALIGN: usize> Drop for AtomicSlotLock<'_, SIZE, ALIGN>
+where
+    Aligned<ALIGN>: AlignmentValid,
+{
+    fn drop(&mut self) {
+        // Well, the user didn't write to us. Mean. We can use relaxed ordering
+        // since no writes were ever issued to the slot, and no memory barrier
+        // needs to be inserted.
+        self.0.in_use.store(false, Ordering::Relaxed);
+    }
+}
+// We're a pointer! The pointer can move and we dont care, it's the pointee
+// that's pinned.
+impl<const SIZE: usize, const ALIGN: usize> Unpin for AtomicSlotLock<'_, SIZE, ALIGN> where
+    Aligned<ALIGN>: AlignmentValid
+{
+}
+
+#[expect(private_bounds)]
+impl<'a, const SIZE: usize, const ALIGN: usize> AtomicSlotLock<'a, SIZE, ALIGN>
+where
+    Aligned<ALIGN>: AlignmentValid,
+{
+    /// Populate the locked slot.
+    ///
+    /// See [`FutureSlot::write`].
+    pub fn write<F: Future + Sized + 'a>(self, o: F) -> AtomicOwnedFuture<'a, F::Output> {
+        let slot = self.0.get_ref();
+        let release_on_drop = ReleaseOnDrop(&slot.in_use);
+        let slot = unsafe {
+            // Safety: invariant of self is that we have exclusive access
+            // (in_use is true).
+            let slot = &mut *slot.slot.get();
+            Pin::new_unchecked(slot)
+        };
+        let future = slot.write(o);
+        AtomicOwnedFuture(future, release_on_drop)
+    }
 }
 
 /// Sets the flag to `false` with `Release` ordering on drop.
