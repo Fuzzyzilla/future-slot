@@ -1,6 +1,6 @@
 //! # `future-slot`
 //! A no-std no-alloc box-like datastructure [`FutureSlot`] that allows any
-//! `impl Future` to be written into pinned memory, yielding a
+//! `impl Future` to be written into pinned memory, yielding a concretely typed
 //! [handle](`OwnedFuture`) similar to `Pin<Box<dyn Future>>`.
 //!
 //! This way, many different future types, including the anonymous futures
@@ -168,8 +168,7 @@ align_tys! {
 
 }
 
-/// A slot which can be pinned into static memory and used to name unnamable
-/// futures.
+/// A slot which can be pinned in memory and used to name unnamable futures.
 ///
 /// Use [`Self::write`] to insert a (possibly anonymous) [`impl Future`](Future)
 /// and recieve a type-erased (but fully concrete!) [`OwnedFuture`] which polls
@@ -395,10 +394,10 @@ impl<'a, Output> Future for AtomicOwnedFuture<'a, Output> {
     }
 }
 
-/// Declare a static slot that maps the future type of the call to a concrete
-/// type. Note that this allocates a permanent static section of RAM, which is
-/// re-used only by the same callsite. It is possible to share RAM between
-/// several callsites with direct use of the slot APIs.
+/// Declare a static [`AtomicFutureSlot`] that maps the future type of the call
+/// to a concrete type. Note that this allocates a permanent static section of
+/// RAM, which is re-used only by the same callsite. It is possible to share RAM
+/// between several callsites with direct use of the slot APIs.
 ///
 /// The argument of the macro is the function call who's result should be
 /// pinned.
