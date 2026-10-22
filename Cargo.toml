@@ -7,4 +7,4 @@ description = "A no-std no-alloc `Box<dyn Future>` analogue"
 keywords = ["no-std", "no-alloc", "future", "async", "pin"]
 categories = ["embedded", "asynchronous", "no-std", "no-std::no-alloc"]
 repository = "https://github.com/Fuzzyzilla/future-slot"
-
+license = "MIT"
