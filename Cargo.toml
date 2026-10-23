@@ -1,6 +1,6 @@
 [package]
 name = "future-slot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Aspen Pratt <fuzzyzilla01@gmail.com>"]
 description = "A no-std no-alloc `Box<dyn Future>` analogue"
