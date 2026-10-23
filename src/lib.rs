@@ -13,11 +13,11 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use core::{
-    marker::{PhantomData, PhantomPinned},
+    marker::PhantomData,
     mem::MaybeUninit,
+    ops::{Deref, DerefMut},
     pin::Pin,
     ptr::NonNull,
-    task::{Context, Poll},
 };
 
 #[cfg(target_has_atomic = "8")]
@@ -178,7 +178,7 @@ align_tys! {
 
 }
 
-/// A slot which can be pinned in memory and used to name unnamable futures.
+/// A slot which can be used to name unnamable futures.
 ///
 /// Use [`Self::write`] to insert a (possibly anonymous) [`impl Future`](Future)
 /// and recieve a type-erased (but fully concrete!) [`OwnedFuture`] which polls
@@ -202,9 +202,6 @@ where
     // Field order is important. Bytes must come immediately after _align.
     _align: Aligned<ALIGN>,
     bytes: MaybeUninit<[u8; SIZE]>,
-    // Once we are pinned, we must never move. This allows !Unpin types to
-    // reside in the slot.
-    _pinned: PhantomPinned,
 }
 #[expect(private_bounds)]
 impl<const ALIGN: usize> FutureSlot<0, ALIGN>
@@ -213,12 +210,11 @@ where
 {
     /// Convenience function to conjure any zero-sized slot for free. This can
     /// be used with the standard APIs to box zero-sized futures.
-    pub const fn conjure() -> Pin<&'static mut Self> {
-        let zst = const {
+    pub const fn conjure() -> &'static mut Self {
+        const {
             assert!(size_of::<Self>() == 0);
             unsafe { &mut *core::ptr::dangling_mut::<Self>() }
-        };
-        Pin::static_mut(zst)
+        }
     }
 }
 #[expect(private_bounds)]
@@ -226,24 +222,25 @@ impl<const SIZE: usize, const ALIGN: usize> FutureSlot<SIZE, ALIGN>
 where
     Aligned<ALIGN>: AlignmentValid,
 {
-    /// Create an empty box. It is up to the caller to ensure that it is pinned
-    /// before use.
+    /// Create an empty slot where a future can be boxed into.
     pub const fn new() -> Self {
         Self {
             _align: Aligned(unsafe { core::mem::zeroed() }),
             bytes: MaybeUninit::uninit(),
-            _pinned: PhantomPinned,
         }
     }
     /// Insert a concrete type into the box.
     ///
     /// Statically asserts that the box has sufficient size/alignment for the
     /// concrete type, causing a compile error if not.
+    ///
+    /// The resulting future is always pinned, as it borrows `self` and
+    /// therefore prevents `self` from moving automatically.
     pub fn write<'a, F: Future + Sized + 'a>(
-        self: Pin<&'a mut Self>,
+        self: &'a mut Self,
         // We take F by value, so we know it hasn't been pinned already.
         o: F,
-    ) -> OwnedFuture<'a, F::Output> {
+    ) -> Pin<OwnedFuture<'a, F::Output>> {
         // Note: The box is known to be empty, as the `mut` reciever requires
         // that no outstanding `OwnedFuture` occupies this box.
         const {
@@ -257,27 +254,29 @@ where
             );
         }
 
-        // Safety: we promise not to move out of this.
-        let this = unsafe { self.get_unchecked_mut() };
-
         // Copy o as bytes into our space.
         let o = MaybeUninit::new(o);
         unsafe {
-            core::ptr::copy_nonoverlapping(o.as_ptr(), this.bytes.as_mut_ptr().cast::<F>(), 1)
+            core::ptr::copy_nonoverlapping(o.as_ptr(), self.bytes.as_mut_ptr().cast::<F>(), 1)
         };
         // Moved out of, explicitly forget the old copy on the stack.
         core::mem::forget(o);
 
         // View the bytes as an `F` again for lifetime 'a. Remember, this is
         // pinned now, dont move it!
-        let fut = unsafe { this.bytes.as_mut_ptr().cast::<F>().as_mut_unchecked::<'a>() };
-        OwnedFuture {
+        let fut = unsafe { self.bytes.as_mut_ptr().cast::<F>().as_mut_unchecked::<'a>() };
+        let owned = OwnedFuture {
             // Hand ownership over to this handle, which will handle dropping it
             // too.
 
             // Coerces into an erased type.
             slot: NonNull::from_mut(fut),
             _borrow: PhantomData,
+        };
+        unsafe {
+            // Safety: We can't move the memory because the owned handle borrows
+            // us and drops the future before we can ever observe it again.
+            Pin::new_unchecked(owned)
         }
     }
 }
@@ -286,20 +285,22 @@ where
 /// non-allocating counterpart to `Box<dyn Future>`. It even has the same repr!
 #[repr(transparent)]
 pub struct OwnedFuture<'a, Output> {
-    /// Pointer into Pinned slot memory, which contains an *owned* concrete type
+    /// Pointer into slot memory, which contains an *owned* concrete type
     /// represented by VTable. This needs to be a pointer instead of a ref since
     /// we need to drop-in-place in our dtor.
     slot: NonNull<dyn Future<Output = Output> + 'a>,
     /// Marker for lifetime variance.
     _borrow: PhantomData<&'a mut (dyn Future<Output = Output> + 'a)>,
 }
-impl<'a, Output> OwnedFuture<'a, Output> {
-    /// Helper function to access the future with its very nuanced lifetimes.
-    fn get_fut<'borrow>(&'borrow mut self) -> Pin<&'borrow mut (dyn Future<Output = Output> + 'a)> {
-        unsafe {
-            let fut = self.slot.as_mut();
-            Pin::new_unchecked(fut)
-        }
+impl<'a, Output> Deref for OwnedFuture<'a, Output> {
+    type Target = dyn Future<Output = Output> + 'a;
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.slot.as_ref() }
+    }
+}
+impl<'a, Output> DerefMut for OwnedFuture<'a, Output> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.slot.as_mut() }
     }
 }
 // We're a pointer! The pointer can move and we dont care, it's the pointee
@@ -313,24 +314,17 @@ impl<Output> Drop for OwnedFuture<'_, Output> {
         }
     }
 }
-impl<Output> Future for OwnedFuture<'_, Output> {
-    type Output = Output;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.get_fut().poll(cx)
-    }
-}
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use core::task::{Context, Poll};
     /// Naive polling executor.
     fn poll_once<F: core::future::Future>(future: &mut F) -> Option<F::Output>
     where
         F: Unpin,
     {
-        match Pin::new(future).poll(&mut core::task::Context::from_waker(
-            core::task::Waker::noop(),
-        )) {
+        match Pin::new(future).poll(&mut Context::from_waker(core::task::Waker::noop())) {
             Poll::Pending => None,
             Poll::Ready(r) => Some(r),
         }
@@ -339,9 +333,10 @@ mod test {
     fn dumb_block_on<F: core::future::Future>(future: F) -> F::Output {
         let mut future = core::pin::pin!(future);
         loop {
-            if let core::task::Poll::Ready(r) = future.as_mut().poll(
-                &mut core::task::Context::from_waker(core::task::Waker::noop()),
-            ) {
+            if let Poll::Ready(r) = future
+                .as_mut()
+                .poll(&mut Context::from_waker(core::task::Waker::noop()))
+            {
                 return r;
             }
         }
@@ -417,10 +412,10 @@ mod test {
     }
     #[test]
     fn conjure() {
-        let mut slot = FutureSlot::<0, 2048>::conjure();
+        let slot = FutureSlot::<0, 2048>::conjure();
         {
             // Not technically guaranteed.
-            let mut fut = slot.as_mut().write(core::future::pending::<u128>());
+            let mut fut = slot.write(core::future::pending::<u128>());
             assert_eq!(poll_once(&mut fut), None);
         }
         {
@@ -431,7 +426,7 @@ mod test {
                     Poll::Ready(123456789)
                 }
             }
-            let mut fut = slot.as_mut().write(Zst);
+            let mut fut = slot.write(Zst);
             assert_eq!(poll_once(&mut fut), Some(123456789));
         }
     }

@@ -3,9 +3,9 @@
 
 use core::{
     cell::UnsafeCell,
+    ops::{Deref, DerefMut},
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
-    task::{Context, Poll},
 };
 
 use super::{Aligned, AlignmentValid, FutureSlot, OwnedFuture};
@@ -24,8 +24,7 @@ impl<const SIZE: usize, const ALIGN: usize> AtomicFutureSlot<SIZE, ALIGN>
 where
     Aligned<ALIGN>: AlignmentValid,
 {
-    /// Create an empty box. It is up to the caller to ensure that it is pinned
-    /// before use.
+    /// Create an empty slot where a future can be boxed into.
     pub const fn new() -> Self {
         Self {
             slot: UnsafeCell::new(FutureSlot::new()),
@@ -35,7 +34,7 @@ where
     /// Try to get write access to the slot. Call [`AtomicSlotLock::write`] to
     /// populate it. Returns None if there is still a outstanding
     /// [`AtomicOwnedFuture`] residing in this slot.
-    pub fn try_lock(self: Pin<&'_ Self>) -> Option<AtomicSlotLock<'_, SIZE, ALIGN>> {
+    pub fn try_lock(self: &'_ Self) -> Option<AtomicSlotLock<'_, SIZE, ALIGN>> {
         if self.in_use.swap(true, Ordering::Acquire) {
             // Already in use.
             None
@@ -48,9 +47,9 @@ where
     ///
     /// `f` is only called when the slot is successfully acquired.
     pub fn try_write_with<'a, F: Future + Sized + 'a>(
-        self: Pin<&'a Self>,
+        self: &'a Self,
         f: impl FnOnce() -> F,
-    ) -> Option<AtomicOwnedFuture<'a, F::Output>> {
+    ) -> Option<Pin<AtomicOwnedFuture<'a, F::Output>>> {
         self.try_lock().map(|slot| slot.write(f()))
     }
     /// Try to insert a future into this slot, returning None if there is still
@@ -59,9 +58,9 @@ where
     /// If `o` is expensive to compute, use [`Self::try_write_with`] instead to
     /// avoid constructing the future in cases when the slot is full anyway.
     pub fn try_write<'a, F: Future + Sized + 'a>(
-        self: Pin<&'a Self>,
+        self: &'a Self,
         o: F,
-    ) -> Option<AtomicOwnedFuture<'a, F::Output>> {
+    ) -> Option<Pin<AtomicOwnedFuture<'a, F::Output>>> {
         self.try_lock().map(|slot| slot.write(o))
     }
 }
@@ -79,7 +78,7 @@ unsafe impl<const SIZE: usize, const ALIGN: usize> Sync for AtomicFutureSlot<SIZ
 #[expect(private_bounds)]
 pub struct AtomicSlotLock<'a, const SIZE: usize, const ALIGN: usize>(
     /// Invariant: We have exclusive access to this slot, and in_use is true.
-    Pin<&'a AtomicFutureSlot<SIZE, ALIGN>>,
+    &'a AtomicFutureSlot<SIZE, ALIGN>,
 )
 where
     Aligned<ALIGN>: AlignmentValid;
@@ -109,17 +108,23 @@ where
     /// Populate the locked slot.
     ///
     /// See [`FutureSlot::write`].
-    pub fn write<F: Future + Sized + 'a>(self, o: F) -> AtomicOwnedFuture<'a, F::Output> {
-        let slot = self.0.get_ref();
-        let release_on_drop = ReleaseOnDrop(&slot.in_use);
+    pub fn write<F: Future + Sized + 'a>(self, o: F) -> Pin<AtomicOwnedFuture<'a, F::Output>> {
+        let release_on_drop = ReleaseOnDrop(&self.0.in_use);
         let slot = unsafe {
             // Safety: invariant of self is that we have exclusive access
             // (in_use is true).
-            let slot = &mut *slot.slot.get();
-            Pin::new_unchecked(slot)
+            self.0.slot.get().as_mut_unchecked::<'a>()
         };
         let future = slot.write(o);
-        AtomicOwnedFuture(future, release_on_drop)
+        unsafe {
+            // Safety: inner ptr was pinned, so we're pinned too.
+            Pin::new_unchecked(AtomicOwnedFuture(
+                // Safety: we are transferring the pinned-ness of the pointee to
+                // the new pointer, not forgetting it entirely.
+                Pin::into_inner_unchecked(future),
+                release_on_drop,
+            ))
+        }
     }
 }
 
@@ -141,16 +146,21 @@ pub struct AtomicOwnedFuture<'a, Output: 'static>(
     // that handles the logic.
     #[expect(unused)] ReleaseOnDrop<'a>,
 );
+impl<'a, Output: 'static> Deref for AtomicOwnedFuture<'a, Output> {
+    type Target = dyn Future<Output = Output> + 'a;
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl<'a, Output: 'static> DerefMut for AtomicOwnedFuture<'a, Output> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
+    }
+}
 // We're a pointer! The pointer can move and we dont care, it's the pointee
 // that's pinned.
 impl<'a, Output> Unpin for AtomicOwnedFuture<'_, Output> {}
-impl<'a, Output> Future for AtomicOwnedFuture<'a, Output> {
-    type Output = Output;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Since Self and OwnedFuture are Unpin, this is all safe APIs, yay!
-        Pin::new(&mut self.0).poll(cx)
-    }
-}
 
 /// Declare a static [`AtomicFutureSlot`] that maps the future type of the call
 /// to a concrete type. Note that this allocates a permanent static section of
@@ -229,10 +239,8 @@ macro_rules! pin_to_static {
         {
             const SIZE: usize = $crate::size_of_output($first$(::$path)*$(::<$($generic),*>)?);
             const ALIGN: usize = $crate::align_of_output($first$(::$path)*$(::<$($generic),*>)?);
-            const SLOT: ::core::pin::Pin<&'static $crate::atomic::AtomicFutureSlot<SIZE, ALIGN>> = {
-                static SLOT: $crate::atomic::AtomicFutureSlot<SIZE, ALIGN> = $crate::atomic::AtomicFutureSlot::new();
-                ::core::pin::Pin::static_ref(&SLOT)
-            };
+            static SLOT: $crate::atomic::AtomicFutureSlot<SIZE, ALIGN>
+                = $crate::atomic::AtomicFutureSlot::new();
 
             SLOT.try_write_with(
                 move || {
