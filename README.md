@@ -9,4 +9,4 @@ concrete type.
 Includes a macro for wrapping a function call in such a slot, statically
 allocating the correct amount of memory for the implied return type.
 
-<img alt="Pinned" src="https://github.com/user-attachments/assets/f9533b16-a8da-4b2f-b0b5-6126b6ceea8c" width="100px" />
+<img alt="Pinned" src="logo.png" width="100px" />
