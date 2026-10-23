@@ -10,25 +10,31 @@
 //! Also includes [a macro](pin_to_static) for wrapping a function call in such
 //! a slot, statically allocating the correct amount of memory automatically.
 #![no_std]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use core::{
     marker::{PhantomData, PhantomPinned},
-    mem::{ManuallyDrop, MaybeUninit},
+    mem::MaybeUninit,
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
 };
 
 #[cfg(target_has_atomic = "8")]
+#[cfg_attr(docsrs, doc(cfg(target_has_atomic = "8")))]
 pub mod atomic;
 
+mod sealed {
+    pub(super) trait Sealed<Args> {}
+}
 /// Trait smuggling the output type out of a function, where the type may be
 /// anonymous.
 ///
 /// Copy bound asserts no dtor, which allows it to be used as the argument to a
 /// const function.
 #[diagnostic::on_unimplemented(message = "implemented on functions with arity up to 12")]
-trait HasOutput<Args>: Copy {
+#[expect(private_bounds)]
+pub trait HasOutput<Args>: Copy + sealed::Sealed<Args> {
     type Output;
 }
 macro_rules! fns {
@@ -44,6 +50,10 @@ macro_rules! fns {
             $(,)?
         } => {
             $(
+                impl<Func, Output, $($arg),*> sealed::Sealed<($($arg),*,)>
+                    for Func
+                    where
+                        Func: Copy + FnOnce($($arg),*) -> Output {}
                 impl<Func, Output, $($arg),*> HasOutput<($($arg),*,)>
                     for Func
                     where
@@ -55,6 +65,7 @@ macro_rules! fns {
         };
     }
 // Special-case zero arg version.
+impl<Func, Output> sealed::Sealed<()> for Func where Func: Copy + FnOnce() -> Output {}
 impl<Func, Output> HasOutput<()> for Func
 where
     Func: Copy + FnOnce() -> Output,
@@ -79,13 +90,11 @@ fns! {
 
 /// Returns the size of the return type of the function `F`, even if the type is
 /// anonymous.
-#[expect(private_bounds)]
 pub const fn size_of_output<Args, F: HasOutput<Args>>(_: F) -> usize {
     size_of::<F::Output>()
 }
 /// Returns the align of the return type of the function `F`, even if the type
 /// is anonymous.
-#[expect(private_bounds)]
 pub const fn align_of_output<Args, F: HasOutput<Args>>(_: F) -> usize {
     align_of::<F::Output>()
 }
@@ -198,6 +207,21 @@ where
     _pinned: PhantomPinned,
 }
 #[expect(private_bounds)]
+impl<const ALIGN: usize> FutureSlot<0, ALIGN>
+where
+    Aligned<ALIGN>: AlignmentValid,
+{
+    /// Convenience function to conjure any zero-sized slot for free. This can
+    /// be used with the standard APIs to box zero-sized futures.
+    pub const fn conjure() -> Pin<&'static mut Self> {
+        let zst = const {
+            assert!(size_of::<Self>() == 0);
+            unsafe { &mut *core::ptr::dangling_mut::<Self>() }
+        };
+        Pin::static_mut(zst)
+    }
+}
+#[expect(private_bounds)]
 impl<const SIZE: usize, const ALIGN: usize> FutureSlot<SIZE, ALIGN>
 where
     Aligned<ALIGN>: AlignmentValid,
@@ -237,14 +261,9 @@ where
         let this = unsafe { self.get_unchecked_mut() };
 
         // Copy o as bytes into our space.
-        let o = ManuallyDrop::new(o);
-        let size = core::mem::size_of_val(&o);
+        let o = MaybeUninit::new(o);
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                (&raw const o).cast::<u8>(),
-                this.bytes.as_mut_ptr().cast::<u8>(),
-                size,
-            )
+            core::ptr::copy_nonoverlapping(o.as_ptr(), this.bytes.as_mut_ptr().cast::<F>(), 1)
         };
         // Moved out of, explicitly forget the old copy on the stack.
         core::mem::forget(o);
@@ -339,7 +358,6 @@ mod test {
             }
         })
     }
-
     #[test]
     fn output_size() {
         use core::convert::identity;
@@ -355,6 +373,24 @@ mod test {
         assert_eq!(align_of_output(identity::<(u8, u128)>), align_of::<u128>());
         assert_eq!(align_of_output(identity::<u64>), align_of::<u64>());
         assert_eq!(align_of_output(identity::<[u8; 13]>), 1);
+    }
+    #[test]
+    fn align() {
+        macro_rules! test_align {
+            ($($align:literal),*$(,)?) => {
+                $(
+                    assert_eq!(
+                        ::core::mem::align_of::<FutureSlot<0, $align>>(),
+                        $align
+                    );
+                )*
+            };
+        }
+        test_align!(
+            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+            131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216, 33554432,
+            67108864, 134217728, 268435456, 536870912,
+        );
     }
     #[test]
     fn basic() {
@@ -378,6 +414,26 @@ mod test {
         // Re-use that box... Test this with miri to assure that no aliasing
         // occurs!
         assert_eq!(dumb_block_on(box_hello()), 45);
+    }
+    #[test]
+    fn conjure() {
+        let mut slot = FutureSlot::<0, 2048>::conjure();
+        {
+            // Not technically guaranteed.
+            let mut fut = slot.as_mut().write(core::future::pending::<u128>());
+            assert_eq!(poll_once(&mut fut), None);
+        }
+        {
+            struct Zst;
+            impl Future for Zst {
+                type Output = u128;
+                fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                    Poll::Ready(123456789)
+                }
+            }
+            let mut fut = slot.as_mut().write(Zst);
+            assert_eq!(poll_once(&mut fut), Some(123456789));
+        }
     }
     #[test]
     fn drop_glue() {
